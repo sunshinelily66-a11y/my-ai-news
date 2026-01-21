@@ -228,4 +228,302 @@ def deepseek_chat_json(prompt: str, timeout=120):
     content = r.json()["choices"][0]["message"]["content"]
     content = normalize_json_text(content)
 
-    # 1) 直接解
+    # 1) 直接解析
+    parsed = try_parse_json(content)
+    if parsed is not None:
+        return parsed
+
+    # 2) 抽取 {...} 解析
+    extracted = extract_json_object(content)
+    extracted = normalize_json_text(extracted)
+    parsed = try_parse_json(extracted)
+    if parsed is not None:
+        return parsed
+
+    # 3) 自动修复再解析
+    print("DeepSeek raw output (first 900 chars):")
+    print(content[:900])
+
+    repair_prompt = f"""
+你刚刚输出的内容不是严格 JSON，导致解析失败。
+请将下面内容修复为严格 JSON，并且只输出 JSON 本体，不要输出任何解释文字。
+
+待修复内容：
+{content}
+""".strip()
+
+    payload_repair = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": repair_prompt}],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+
+    r2 = requests.post(url, headers=headers, data=json.dumps(payload_repair), timeout=timeout)
+    r2.raise_for_status()
+    content2 = r2.json()["choices"][0]["message"]["content"]
+    content2 = normalize_json_text(content2)
+
+    parsed = try_parse_json(content2)
+    if parsed is not None:
+        return parsed
+
+    extracted2 = extract_json_object(content2)
+    extracted2 = normalize_json_text(extracted2)
+    parsed = try_parse_json(extracted2)
+    if parsed is not None:
+        return parsed
+
+    print("DeepSeek repaired output (first 900 chars):")
+    print(content2[:900])
+    raise RuntimeError("DeepSeek output is not valid JSON even after repair.")
+
+
+def build_prompt(mode: str, input_text: str) -> str:
+    """
+    mode:
+      - morning: 晨报研报型（少而精，分析更深）
+      - afternoon: 资讯快报型（快而密，覆盖更多）
+    """
+    if mode == "morning":
+        schema_hint = {
+            "date": "YYYY-MM-DD",
+            "window_hours": 48,
+            "style": "晨报研报型",
+            "top": [
+                {
+                    "title_cn": "中文标题",
+                    "event_cn": "发生了什么",
+                    "why_cn": "为什么重要",
+                    "market_cn": "资本市场含义（预期差/催化剂/风险）",
+                    "product_cn": "产品与应用含义（落地/商业化/竞品）",
+                    "catalysts_cn": ["催化剂1", "催化剂2"],
+                    "risks_cn": ["风险1", "风险2"],
+                    "confidence": "high|medium|low",
+                    "urls": ["url"]
+                }
+            ],
+            "financing": [
+                {
+                    "deal_cn": "融资/并购/合作",
+                    "players_cn": "参与方",
+                    "take_cn": "一句话判断",
+                    "confidence": "high|medium|low",
+                    "urls": ["url"]
+                }
+            ],
+            "watchlist": [
+                {
+                    "item_cn": "跟踪项",
+                    "metric_cn": "指标",
+                    "timeframe": "7d|14d|30d|this_week",
+                    "why_cn": "原因"
+                }
+            ],
+            "sources": ["url"]
+        }
+
+        requirements = """
+输出目标：更像投研晨报，强调公司动态、产品发布、投融资，少而精。
+约束：
+- top 最多 8 条
+- 每条都写：事件、重要性、资本市场含义、产品与应用含义、催化剂、风险
+- financing 最多 8 条
+- watchlist 给 5 条
+"""
+
+    else:
+        schema_hint = {
+            "date": "YYYY-MM-DD",
+            "window_hours": 48,
+            "style": "资讯快报型",
+            "briefs": [
+                {
+                    "title_cn": "中文标题",
+                    "one_liner_cn": "一句话快报",
+                    "tags": ["公司动态", "产品发布", "投融资", "监管", "开源"],
+                    "confidence": "high|medium|low",
+                    "urls": ["url"]
+                }
+            ],
+            "financing_briefs": [
+                {
+                    "one_liner_cn": "一句话投融资/合作快讯",
+                    "confidence": "high|medium|low",
+                    "urls": ["url"]
+                }
+            ],
+            "sources": ["url"]
+        }
+
+        requirements = """
+输出目标：更像资讯快讯流，覆盖更多信息点，快速扫一遍就能掌握。
+约束：
+- briefs 最多 15 条
+- 每条一句话，附标签与链接
+- 单独列出融资/合作快讯区块，最多 10 条
+"""
+
+    prompt = f"""
+你是 AI 资讯编辑。请基于输入材料生成日报，窗口为最近 48 小时。
+硬性要求：
+1) 全部中文输出。
+2) 事实只能来自输入材料，不要编造。
+3) 同一事件多条来源合并，避免重复。
+4) 每条必须带 urls（1-3个）。
+5) 输出必须是严格 JSON，结构参考 schema_hint。
+
+{requirements}
+
+schema_hint:
+{json.dumps(schema_hint, ensure_ascii=False)}
+
+输入材料：
+{input_text}
+""".strip()
+
+    return prompt
+
+
+# =========================
+# 渲染为飞书文本
+# =========================
+def render_text(mode: str, digest: dict) -> str:
+    date = digest.get("date") or now_bj().date().isoformat()
+    style = digest.get("style", "")
+
+    def join_urls(urls):
+        return "；".join((urls or [])[:3])
+
+    lines = []
+
+    if mode == "morning":
+        lines.append(f"AI 晨报（近48小时） | {date}")
+        if style:
+            lines.append(f"风格：{style}")
+        lines.append("")
+
+        top = digest.get("top", []) or []
+        lines.append("一、重点事件")
+        if not top:
+            lines.append("暂无")
+        else:
+            for i, x in enumerate(top[:8], 1):
+                lines.append(f"{i}. {x.get('title_cn','')}")
+                lines.append(f"   事件：{x.get('event_cn','')}")
+                lines.append(f"   重要性：{x.get('why_cn','')}")
+                lines.append(f"   资本市场：{x.get('market_cn','')}")
+                lines.append(f"   产品与应用：{x.get('product_cn','')}")
+                catalysts = x.get("catalysts_cn", []) or []
+                risks = x.get("risks_cn", []) or []
+                if catalysts:
+                    lines.append(f"   催化剂：{'；'.join(catalysts[:3])}")
+                if risks:
+                    lines.append(f"   风险：{'；'.join(risks[:3])}")
+                lines.append(f"   置信度：{x.get('confidence','')}")
+                lines.append(f"   链接：{join_urls(x.get('urls', []))}")
+                lines.append("")
+
+        fin = digest.get("financing", []) or []
+        lines.append("二、投融资与合作")
+        if not fin:
+            lines.append("暂无")
+        else:
+            for i, x in enumerate(fin[:8], 1):
+                lines.append(f"{i}. {x.get('deal_cn','')}")
+                lines.append(f"   参与方：{x.get('players_cn','')}")
+                lines.append(f"   判断：{x.get('take_cn','')}")
+                lines.append(f"   置信度：{x.get('confidence','')}")
+                lines.append(f"   链接：{join_urls(x.get('urls', []))}")
+                lines.append("")
+
+        wl = digest.get("watchlist", []) or []
+        lines.append("三、Watchlist")
+        if not wl:
+            lines.append("暂无")
+        else:
+            for i, x in enumerate(wl[:6], 1):
+                lines.append(f"{i}. {x.get('item_cn','')}")
+                lines.append(f"   指标：{x.get('metric_cn','')}")
+                lines.append(f"   时间：{x.get('timeframe','')}")
+                lines.append(f"   原因：{x.get('why_cn','')}")
+                lines.append("")
+
+    else:
+        lines.append(f"AI 快报（近48小时） | {date}")
+        if style:
+            lines.append(f"风格：{style}")
+        lines.append("")
+
+        briefs = digest.get("briefs", []) or []
+        lines.append("一、快讯")
+        if not briefs:
+            lines.append("暂无")
+        else:
+            for i, x in enumerate(briefs[:15], 1):
+                tags = x.get("tags", []) or []
+                tag_str = "、".join(tags[:5])
+                lines.append(f"{i}. {x.get('title_cn','')}")
+                lines.append(f"   {x.get('one_liner_cn','')}")
+                if tag_str:
+                    lines.append(f"   标签：{tag_str}")
+                lines.append(f"   置信度：{x.get('confidence','')}")
+                lines.append(f"   链接：{join_urls(x.get('urls', []))}")
+                lines.append("")
+
+        fbriefs = digest.get("financing_briefs", []) or []
+        lines.append("二、投融资/合作快讯")
+        if not fbriefs:
+            lines.append("暂无")
+        else:
+            for i, x in enumerate(fbriefs[:10], 1):
+                lines.append(f"{i}. {x.get('one_liner_cn','')}")
+                lines.append(f"   置信度：{x.get('confidence','')}")
+                lines.append(f"   链接：{join_urls(x.get('urls', []))}")
+                lines.append("")
+
+    msg = "\n".join(lines)
+    return msg[:18000]
+
+
+# =========================
+# 飞书推送
+# =========================
+def send_feishu(webhook: str, text: str):
+    if not webhook:
+        raise RuntimeError("Missing Feishu webhook")
+
+    payload = {"msg_type": "text", "content": {"text": text}}
+    r = requests.post(webhook, json=payload, timeout=30)
+    r.raise_for_status()
+
+
+# =========================
+# 主入口
+# =========================
+def main():
+    mode = (sys.argv[1] if len(sys.argv) > 1 else "morning").strip().lower()
+    if mode not in ["morning", "afternoon"]:
+        raise ValueError("mode must be morning or afternoon")
+
+    webhook = FEISHU_WEBHOOK_MORNING if mode == "morning" else FEISHU_WEBHOOK_AFTERNOON
+    label = "晨报" if mode == "morning" else "快报"
+
+    items = fetch_recent_items(hours=RECENT_HOURS, max_items=MAX_ITEMS_TOTAL)
+
+    if not items:
+        fallback = f"AI {label}（近48小时） | {now_bj().date().isoformat()}\n\n过去48小时未抓取到可用条目。"
+        send_feishu(webhook, fallback)
+        return
+
+    input_text = build_input_text(items)
+    prompt = build_prompt(mode=mode, input_text=input_text)
+
+    digest = deepseek_chat_json(prompt)
+    text = render_text(mode=mode, digest=digest)
+
+    send_feishu(webhook, text)
+
+
+if __name__ == "__main__":
+    main()
