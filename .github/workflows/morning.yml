@@ -21,6 +21,6 @@ jobs:
       - name: Run morning digest
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          FEISHU_WEBHOOK_MORNING: ${{ secrets.FEISHU_WEBHOOK_MORNING }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           RSSHUB_BASE: ${{ secrets.RSSHUB_BASE }}
         run: python morning_digest.py
