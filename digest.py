@@ -18,7 +18,7 @@ TZ = ZoneInfo("Asia/Shanghai")
 RECENT_HOURS = 48
 
 # 条目上限建议不要太大，避免模型输出过长导致 JSON 更容易损坏
-MAX_ITEMS_TOTAL = 55
+MAX_ITEMS_TOTAL = 35
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 
@@ -517,9 +517,94 @@ def main():
         return
 
     input_text = build_input_text(items)
+    def truncate_text(s: str, max_chars: int) -> str:
+    if not s:
+        return s
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + "\n\n（内容过长已截断）"
     prompt = build_prompt(mode=mode, input_text=input_text)
 
-    digest = deepseek_chat_json(prompt)
+    def deepseek_chat_json(prompt: str, timeout=120, max_tokens=2200):
+    """
+    返回 dict，确保可解析 JSON
+    增加 max_tokens，避免输出被截断导致 JSON 断裂
+    """
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError("Missing DEEPSEEK_API_KEY")
+
+    url = "https://api.deepseek.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+
+    # prompt 太长会显著提高截断概率，先做硬截断
+    prompt = truncate_text(prompt, max_chars=14000)
+
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+
+    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout)
+    r.raise_for_status()
+
+    content = r.json()["choices"][0]["message"]["content"]
+    content = normalize_json_text(content)
+
+    # 1) 直接解析
+    parsed = try_parse_json(content)
+    if parsed is not None:
+        return parsed
+
+    # 2) 抽取 {...} 解析
+    extracted = extract_json_object(content)
+    extracted = normalize_json_text(extracted)
+    parsed = try_parse_json(extracted)
+    if parsed is not None:
+        return parsed
+
+    # 3) 自动修复再解析
+    print("DeepSeek raw output (first 900 chars):")
+    print(content[:900])
+
+    repair_prompt = f"""
+你刚刚输出的内容不是严格 JSON，导致解析失败。
+请将下面内容修复为严格 JSON，并且只输出 JSON 本体，不要输出任何解释文字。
+
+待修复内容：
+{content}
+""".strip()
+
+    payload_repair = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": repair_prompt}],
+        "temperature": 0,
+        "max_tokens": 2200,
+        "response_format": {"type": "json_object"},
+    }
+
+    r2 = requests.post(url, headers=headers, data=json.dumps(payload_repair), timeout=timeout)
+    r2.raise_for_status()
+    content2 = r2.json()["choices"][0]["message"]["content"]
+    content2 = normalize_json_text(content2)
+
+    parsed = try_parse_json(content2)
+    if parsed is not None:
+        return parsed
+
+    extracted2 = extract_json_object(content2)
+    extracted2 = normalize_json_text(extracted2)
+    parsed = try_parse_json(extracted2)
+    if parsed is not None:
+        return parsed
+
+    print("DeepSeek repaired output (first 900 chars):")
+    print(content2[:900])
+
+    raise RuntimeError("DeepSeek output is not valid JSON even after repair.")
+
     text = render_text(mode=mode, digest=digest)
 
     send_feishu(webhook, text)
