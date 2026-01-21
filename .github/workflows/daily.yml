@@ -1,14 +1,12 @@
-name: ai-daily-digest
+name: morning-digest
 
 on:
   schedule:
-    - cron: "0 1 * * *"  # 09:00 Beijing (UTC 01:00)
-    - cron: "0 9 * * *"  # 17:00 Beijing (UTC 09:00)
+    - cron: "0 1 * * *"
   workflow_dispatch:
 
 jobs:
-  morning:
-    name: Morning digest (09:00 Beijing)
+  run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,31 +18,9 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run morning
+      - name: Run morning digest
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           FEISHU_WEBHOOK_MORNING: ${{ secrets.FEISHU_WEBHOOK_MORNING }}
-          FEISHU_WEBHOOK_AFTERNOON: ${{ secrets.FEISHU_WEBHOOK_AFTERNOON }}
           RSSHUB_BASE: ${{ secrets.RSSHUB_BASE }}
-        run: python digest.py morning
-
-  afternoon:
-    name: Afternoon brief (17:00 Beijing)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: pip install -r requirements.txt
-
-      - name: Run afternoon
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          FEISHU_WEBHOOK_MORNING: ${{ secrets.FEISHU_WEBHOOK_MORNING }}
-          FEISHU_WEBHOOK_AFTERNOON: ${{ secrets.FEISHU_WEBHOOK_AFTERNOON }}
-          RSSHUB_BASE: ${{ secrets.RSSHUB_BASE }}
-        run: python digest.py afternoon
+        run: python morning_digest.py
