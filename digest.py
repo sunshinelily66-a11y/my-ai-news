@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import datetime
 from zoneinfo import ZoneInfo
@@ -8,41 +9,18 @@ import feedparser
 from dateutil import parser as dtparser
 
 
-FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "").strip()
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
-
-# 48h 时效窗口
+# ===== 基础配置 =====
 RECENT_HOURS = 48
-MAX_ITEMS_TOTAL = 45  # 条目多一点，后面交给模型做合并与筛选
+MAX_ITEMS_TOTAL = 80  # 中文源加多后，条目会变多，留足空间给模型筛选
+TZ = ZoneInfo("Asia/Shanghai")
 
-# 更丰富的信息源：公司动态 + 产品发布 + 商业咨询/投融资
-# 说明：尽量选英文主流来源，避免中文站点依赖
-RSS_FEEDS = [
-    # 产品与生态
-    "https://huggingface.co/blog/feed.xml",
-    "https://www.microsoft.com/en-us/research/blog/feed/",
-    "https://blog.google/rss/",
-    "https://openai.com/blog/rss.xml",
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+FEISHU_WEBHOOK_MORNING = os.getenv("FEISHU_WEBHOOK_MORNING", "").strip()
+FEISHU_WEBHOOK_AFTERNOON = os.getenv("FEISHU_WEBHOOK_AFTERNOON", "").strip()
 
-    # 技术与行业资讯
-    "https://www.theverge.com/rss/index.xml",
-    "https://www.wired.com/feed/rss",
-    "https://www.technologyreview.com/feed/",
-
-    # 投融资与商业动态
-    "https://techcrunch.com/feed/",
-    "https://www.theinformation.com/feed",  # 若不可用可删除
-    "https://www.ft.com/technology?format=rss",
-
-    # 咨询与研究机构
-    "https://www.gartner.com/en/newsroom/rss",
-    "https://www.mckinsey.com/featured-insights/rss",
-    "https://www.bcg.com/rss",
-    "https://www.bain.com/rss/",
-
-    # 论文补充
-    "https://arxiv.org/rss/cs.AI",
-]
+# RSSHub 基地址（你需要改成可用的实例）
+# 示例：RSSHUB_BASE="https://rsshub.app"
+RSSHUB_BASE = os.getenv("RSSHUB_BASE", "https://rsshub.app").strip().rstrip("/")
 
 
 def _safe_parse_time(s: str):
@@ -54,43 +32,87 @@ def _safe_parse_time(s: str):
         return None
 
 
+def _now_bj():
+    return datetime.datetime.now(tz=TZ)
+
+
+# ===== 信息源 =====
+RSS_FEEDS_EN = [
+    "https://openai.com/blog/rss.xml",
+    "https://blog.google/rss/",
+    "https://huggingface.co/blog/feed.xml",
+    "https://www.microsoft.com/en-us/research/blog/feed/",
+    "https://techcrunch.com/feed/",
+    "https://www.theverge.com/rss/index.xml",
+    "https://www.technologyreview.com/feed/",
+    "https://arxiv.org/rss/cs.AI",
+]
+
+# 中文媒体与官方渠道（建议走 RSSHub）
+# 这些 route 可能会因 RSSHub 版本变化而不同
+# 你先跑一遍，哪个报错我再帮你替换为可用 route
+RSS_FEEDS_CN = [
+    # A) 科技媒体快讯
+    f"{RSSHUB_BASE}/36kr/newsflashes",
+    f"{RSSHUB_BASE}/huxiu/article",
+    f"{RSSHUB_BASE}/geekpark/news",
+    f"{RSSHUB_BASE}/qbitai/category",
+    f"{RSSHUB_BASE}/jiqizhixin/news",
+
+    # B) 创投与商业资讯
+    f"{RSSHUB_BASE}/chinaventure/news",
+    f"{RSSHUB_BASE}/pedaily/news",
+    f"{RSSHUB_BASE}/itjuzi/invest",
+
+    # C) 大厂与平台官方（优先“发布/更新/公告”）
+    f"{RSSHUB_BASE}/aliyun/notice",
+    f"{RSSHUB_BASE}/tencentcloud/notice",
+    f"{RSSHUB_BASE}/huaweicloud/notice",
+    f"{RSSHUB_BASE}/volcengine/notice",
+]
+
+RSS_FEEDS = RSS_FEEDS_EN + RSS_FEEDS_CN
+
+
 def fetch_recent_items(hours=RECENT_HOURS, max_items=MAX_ITEMS_TOTAL):
-    now = datetime.datetime.now(tz=ZoneInfo("Asia/Shanghai"))
+    now = _now_bj()
     cutoff = now - datetime.timedelta(hours=hours)
 
     items = []
     for feed_url in RSS_FEEDS:
         feed = feedparser.parse(feed_url)
-        for e in getattr(feed, "entries", [])[:80]:
+        for e in getattr(feed, "entries", [])[:120]:
             title = getattr(e, "title", "").strip()
             link = getattr(e, "link", "").strip()
 
             published = getattr(e, "published", "") or getattr(e, "updated", "") or getattr(e, "pubDate", "")
             published_dt = _safe_parse_time(published)
 
+            published_dt_bj = None
             if published_dt:
                 if published_dt.tzinfo is None:
                     published_dt = published_dt.replace(tzinfo=ZoneInfo("UTC"))
-                published_dt_bj = published_dt.astimezone(ZoneInfo("Asia/Shanghai"))
-            else:
-                published_dt_bj = None
+                published_dt_bj = published_dt.astimezone(TZ)
 
             summary = getattr(e, "summary", "") or getattr(e, "description", "")
+            source = getattr(feed.feed, "title", "") or feed_url
 
             if not title or not link:
                 continue
 
-            # 48h 内过滤：如果拿不到时间就先保留，交给模型判断时效性并降低置信度
-            if published_dt_bj and published_dt_bj < cutoff:
+            # 严格 48h：如果拿不到时间，直接丢弃，保证时效性
+            if not published_dt_bj:
+                continue
+            if published_dt_bj < cutoff:
                 continue
 
             items.append(
                 {
                     "title": title,
                     "url": link,
-                    "published": published_dt_bj.isoformat() if published_dt_bj else published,
-                    "summary": " ".join(summary.replace("\n", " ").split())[:400],
-                    "source": getattr(feed.feed, "title", "") or feed_url,
+                    "published": published_dt_bj.isoformat(),
+                    "summary": " ".join(summary.replace("\n", " ").split())[:500],
+                    "source": source,
                 }
             )
 
@@ -105,15 +127,7 @@ def fetch_recent_items(hours=RECENT_HOURS, max_items=MAX_ITEMS_TOTAL):
         deduped.append(it)
 
     # 按发布时间倒序
-    def sort_key(x):
-        t = _safe_parse_time(x.get("published", ""))
-        if not t:
-            return datetime.datetime(1970, 1, 1, tzinfo=ZoneInfo("UTC"))
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=ZoneInfo("UTC"))
-        return t
-
-    deduped.sort(key=sort_key, reverse=True)
+    deduped.sort(key=lambda x: x["published"], reverse=True)
     return deduped[:max_items]
 
 
@@ -129,73 +143,100 @@ def build_input_text(items):
     return "\n".join(lines)
 
 
-def call_deepseek_digest(input_text: str):
+def call_deepseek(mode: str, input_text: str):
     if not DEEPSEEK_API_KEY:
         raise RuntimeError("Missing DEEPSEEK_API_KEY")
 
     url = "https://api.deepseek.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
 
-    schema_hint = {
-        "date": "YYYY-MM-DD",
-        "window_hours": 48,
-        "top5": [
-            {
-                "title_cn": "中文标题",
-                "one_liner_cn": "一句话总结（中文）",
-                "why_it_matters_cn": "为什么重要（中文，偏商业与投融资视角）",
-                "market_implication_cn": "资本市场含义（中文，预期差/催化剂/风险）",
-                "product_implication_cn": "产品与应用含义（中文，落地场景/商业化）",
-                "confidence": "high|medium|low",
-                "urls": ["url"]
-            }
-        ],
-        "investment_financing": [
-            {
-                "deal": "融资/并购/合作事件",
-                "who": "公司/机构",
-                "what": "发生了什么",
-                "why": "对行业与资金的意义",
-                "confidence": "high|medium|low",
-                "urls": ["url"]
-            }
-        ],
-        "company_product_updates": [
-            {
-                "company": "公司名",
-                "product": "产品名或模块",
-                "update": "更新内容",
-                "who_cares": "谁会在意（开发者/企业/消费者）",
-                "adoption_barriers": ["落地阻力1", "落地阻力2"],
-                "confidence": "high|medium|low",
-                "urls": ["url"]
-            }
-        ],
-        "watchlist": [
-            {
-                "item_cn": "跟踪项",
-                "metric_cn": "要盯的指标",
-                "timeframe": "7d|14d|30d|this_week",
-                "why_cn": "原因"
-            }
-        ],
-        "sources": ["url"]
-    }
+    if mode == "morning":
+        style = "晨报研报型"
+        requirements = """
+输出目标：更像投研晨报，强调“公司动态、产品发布、投融资”，少而精。
+约束：
+- Top 8 以内
+- 每条都要写：事件是什么、为什么重要、对资本市场的含义、对产品与应用的含义、潜在催化剂、主要风险
+- 结尾给 Watchlist（5条）
+"""
+        schema_hint = {
+            "date": "YYYY-MM-DD",
+            "window_hours": 48,
+            "style": "晨报研报型",
+            "top": [
+                {
+                    "title_cn": "中文标题",
+                    "event_cn": "发生了什么",
+                    "why_cn": "为什么重要",
+                    "market_cn": "资本市场含义（预期差/催化剂/风险）",
+                    "product_cn": "产品与应用含义（落地/商业化/竞品）",
+                    "catalysts_cn": ["催化剂1", "催化剂2"],
+                    "risks_cn": ["风险1", "风险2"],
+                    "confidence": "high|medium|low",
+                    "urls": ["url"]
+                }
+            ],
+            "financing": [
+                {
+                    "deal_cn": "融资/并购/合作",
+                    "players_cn": "参与方",
+                    "take_cn": "一句话判断",
+                    "confidence": "high|medium|low",
+                    "urls": ["url"]
+                }
+            ],
+            "watchlist": [
+                {
+                    "item_cn": "跟踪项",
+                    "metric_cn": "指标",
+                    "timeframe": "7d|14d|30d|this_week",
+                    "why_cn": "原因"
+                }
+            ],
+            "sources": ["url"]
+        }
+    else:
+        style = "资讯快报型"
+        requirements = """
+输出目标：更像资讯快讯流，覆盖更多信息点，快速扫一遍就能掌握。
+约束：
+- Top 15 以内
+- 每条只写：一句话 + 标签 + 链接
+- 单独列出“投融资/合作”快讯区块
+"""
+        schema_hint = {
+            "date": "YYYY-MM-DD",
+            "window_hours": 48,
+            "style": "资讯快报型",
+            "briefs": [
+                {
+                    "title_cn": "中文标题",
+                    "one_liner_cn": "一句话快报",
+                    "tags": ["公司动态", "产品发布", "投融资", "监管", "开源"],
+                    "confidence": "high|medium|low",
+                    "urls": ["url"]
+                }
+            ],
+            "financing_briefs": [
+                {
+                    "one_liner_cn": "一句话投融资/合作快讯",
+                    "confidence": "high|medium|low",
+                    "urls": ["url"]
+                }
+            ],
+            "sources": ["url"]
+        }
 
     prompt = f"""
-你是“AI 资讯日报编辑”，读者是关注公司动态、产品发布、投融资的商业人群。
-请基于输入材料生成一份 48 小时 AI 日报。
-
+你是 AI 资讯编辑。请基于输入材料生成【{style}】日报，窗口为最近 48 小时。
 硬性要求：
-1) 输出必须为严格 JSON，结构参考 schema_hint。
-2) 所有文字字段必须是中文输出。
-3) 事实只能来自输入材料，不要编造。
-4) 每条结论必须给出 urls（1-3 个）。
-5) 同一事件多条来源合并为一条，避免重复。
-6) 只保留最近 48 小时内的内容。若时间不明确，可以保留但 confidence 不能为 high。
+1) 全部中文输出。
+2) 事实只能来自输入材料，不要编造。
+3) 同一事件多条来源合并，避免重复。
+4) 每条必须带 urls（1-3个）。
+5) 输出必须是严格 JSON，结构参考 schema_hint。
+
+{requirements}
 
 schema_hint:
 {json.dumps(schema_hint, ensure_ascii=False)}
@@ -211,116 +252,131 @@ schema_hint:
         "response_format": {"type": "json_object"},
     }
 
-    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=90)
+    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=120)
     r.raise_for_status()
-    data = r.json()
-    content = data["choices"][0]["message"]["content"]
+    content = r.json()["choices"][0]["message"]["content"]
     return json.loads(content)
 
 
-def render_text_cn(digest: dict):
-    date = digest.get("date", "")
-    top5 = digest.get("top5", [])
-    inv = digest.get("investment_financing", [])
-    updates = digest.get("company_product_updates", [])
-    watchlist = digest.get("watchlist", [])
-    sources = digest.get("sources", [])
+def render_text(mode: str, digest: dict):
+    date = digest.get("date", _now_bj().date().isoformat())
+    style = digest.get("style", "")
 
-    def fmt_urls(urls):
-        return "；".join(urls[:3]) if urls else ""
+    def join_urls(urls):
+        return "；".join((urls or [])[:3])
 
     lines = []
-    lines.append(f"AI 资讯日报（近48小时） | {date}")
-    lines.append("")
+    if mode == "morning":
+        lines.append(f"AI 晨报（近48小时） | {date}")
+        lines.append(f"风格：{style}")
+        lines.append("")
+        top = digest.get("top", [])
+        lines.append("一、重点事件")
+        if not top:
+            lines.append("暂无")
+        else:
+            for i, x in enumerate(top[:8], 1):
+                lines.append(f"{i}. {x.get('title_cn','')}")
+                lines.append(f"   事件：{x.get('event_cn','')}")
+                lines.append(f"   重要性：{x.get('why_cn','')}")
+                lines.append(f"   资本市场：{x.get('market_cn','')}")
+                lines.append(f"   产品与应用：{x.get('product_cn','')}")
+                catalysts = x.get("catalysts_cn", []) or []
+                risks = x.get("risks_cn", []) or []
+                if catalysts:
+                    lines.append(f"   催化剂：{'；'.join(catalysts[:3])}")
+                if risks:
+                    lines.append(f"   风险：{'；'.join(risks[:3])}")
+                lines.append(f"   置信度：{x.get('confidence','')}")
+                lines.append(f"   链接：{join_urls(x.get('urls', []))}")
+                lines.append("")
 
-    lines.append("一、今日要点 Top 5")
-    if not top5:
-        lines.append("暂无")
+        lines.append("二、投融资与合作")
+        fin = digest.get("financing", [])
+        if not fin:
+            lines.append("暂无")
+        else:
+            for i, x in enumerate(fin[:8], 1):
+                lines.append(f"{i}. {x.get('deal_cn','')}")
+                lines.append(f"   参与方：{x.get('players_cn','')}")
+                lines.append(f"   判断：{x.get('take_cn','')}")
+                lines.append(f"   置信度：{x.get('confidence','')}")
+                lines.append(f"   链接：{join_urls(x.get('urls', []))}")
+                lines.append("")
+
+        lines.append("三、Watchlist")
+        wl = digest.get("watchlist", [])
+        if not wl:
+            lines.append("暂无")
+        else:
+            for i, x in enumerate(wl[:6], 1):
+                lines.append(f"{i}. {x.get('item_cn','')}")
+                lines.append(f"   指标：{x.get('metric_cn','')}")
+                lines.append(f"   时间：{x.get('timeframe','')}")
+                lines.append(f"   原因：{x.get('why_cn','')}")
+                lines.append("")
     else:
-        for i, x in enumerate(top5, 1):
-            lines.append(f"{i}. {x.get('title_cn','')}")
-            lines.append(f"   摘要：{x.get('one_liner_cn','')}")
-            lines.append(f"   为什么重要：{x.get('why_it_matters_cn','')}")
-            lines.append(f"   资本市场：{x.get('market_implication_cn','')}")
-            lines.append(f"   产品与应用：{x.get('product_implication_cn','')}")
-            lines.append(f"   置信度：{x.get('confidence','')}")
-            lines.append(f"   链接：{fmt_urls(x.get('urls', []))}")
-            lines.append("")
+        lines.append(f"AI 快报（近48小时） | {date}")
+        lines.append(f"风格：{style}")
+        lines.append("")
+        briefs = digest.get("briefs", [])
+        lines.append("一、快讯")
+        if not briefs:
+            lines.append("暂无")
+        else:
+            for i, x in enumerate(briefs[:15], 1):
+                tags = x.get("tags", []) or []
+                tag_str = "、".join(tags[:5])
+                lines.append(f"{i}. {x.get('title_cn','')}")
+                lines.append(f"   {x.get('one_liner_cn','')}")
+                if tag_str:
+                    lines.append(f"   标签：{tag_str}")
+                lines.append(f"   置信度：{x.get('confidence','')}")
+                lines.append(f"   链接：{join_urls(x.get('urls', []))}")
+                lines.append("")
 
-    lines.append("二、投融资与商业合作")
-    if not inv:
-        lines.append("暂无")
-    else:
-        for i, x in enumerate(inv, 1):
-            lines.append(f"{i}. {x.get('deal','')}")
-            lines.append(f"   主体：{x.get('who','')}")
-            lines.append(f"   发生了什么：{x.get('what','')}")
-            lines.append(f"   意义：{x.get('why','')}")
-            lines.append(f"   置信度：{x.get('confidence','')}")
-            lines.append(f"   链接：{fmt_urls(x.get('urls', []))}")
-            lines.append("")
+        lines.append("二、投融资/合作快讯")
+        fbriefs = digest.get("financing_briefs", [])
+        if not fbriefs:
+            lines.append("暂无")
+        else:
+            for i, x in enumerate(fbriefs[:10], 1):
+                lines.append(f"{i}. {x.get('one_liner_cn','')}")
+                lines.append(f"   置信度：{x.get('confidence','')}")
+                lines.append(f"   链接：{join_urls(x.get('urls', []))}")
+                lines.append("")
 
-    lines.append("三、公司动态与产品发布")
-    if not updates:
-        lines.append("暂无")
-    else:
-        for i, x in enumerate(updates, 1):
-            lines.append(f"{i}. {x.get('company','')} | {x.get('product','')}")
-            lines.append(f"   更新：{x.get('update','')}")
-            lines.append(f"   谁会在意：{x.get('who_cares','')}")
-            barriers = x.get("adoption_barriers", []) or []
-            if barriers:
-                lines.append(f"   落地阻力：{'；'.join(barriers[:4])}")
-            lines.append(f"   置信度：{x.get('confidence','')}")
-            lines.append(f"   链接：{fmt_urls(x.get('urls', []))}")
-            lines.append("")
-
-    lines.append("四、Watchlist（未来7-30天）")
-    if not watchlist:
-        lines.append("暂无")
-    else:
-        for i, x in enumerate(watchlist, 1):
-            lines.append(f"{i}. {x.get('item_cn','')}")
-            lines.append(f"   指标：{x.get('metric_cn','')}")
-            lines.append(f"   时间：{x.get('timeframe','')}")
-            lines.append(f"   原因：{x.get('why_cn','')}")
-            lines.append("")
-
-    lines.append("五、Sources")
-    if not sources:
-        lines.append("暂无")
-    else:
-        for u in sources[:20]:
-            lines.append(f"- {u}")
-
+    # Sources 可选，不在群里刷屏
     msg = "\n".join(lines)
     return msg[:18000]
 
 
-def send_feishu_text(text: str):
-    if not FEISHU_WEBHOOK:
-        raise RuntimeError("Missing FEISHU_WEBHOOK")
+def send_feishu(webhook: str, text: str):
+    if not webhook:
+        raise RuntimeError("Missing Feishu webhook for this mode")
     payload = {"msg_type": "text", "content": {"text": text}}
-    r = requests.post(FEISHU_WEBHOOK, json=payload, timeout=30)
+    r = requests.post(webhook, json=payload, timeout=30)
     r.raise_for_status()
 
 
 def main():
-    now_bj = datetime.datetime.now(tz=ZoneInfo("Asia/Shanghai"))
-    items = fetch_recent_items(hours=RECENT_HOURS, max_items=MAX_ITEMS_TOTAL)
+    mode = (sys.argv[1] if len(sys.argv) > 1 else "morning").strip().lower()
+    if mode not in ["morning", "afternoon"]:
+        raise ValueError("mode must be morning or afternoon")
 
+    items = fetch_recent_items(hours=RECENT_HOURS, max_items=MAX_ITEMS_TOTAL)
     if not items:
-        send_feishu_text(f"AI 资讯日报（近48小时） | {now_bj.date().isoformat()}\n\n过去 48 小时未抓取到条目。")
+        fallback = f"AI {'晨报' if mode=='morning' else '快报'}（近48小时） | {_now_bj().date().isoformat()}\n\n过去48小时未抓取到可用条目。"
+        webhook = FEISHU_WEBHOOK_MORNING if mode == "morning" else FEISHU_WEBHOOK_AFTERNOON
+        send_feishu(webhook, fallback)
         return
 
     input_text = build_input_text(items)
-    digest = call_deepseek_digest(input_text)
+    digest = call_deepseek(mode=mode, input_text=input_text)
+    text = render_text(mode=mode, digest=digest)
 
-    if not digest.get("date"):
-        digest["date"] = now_bj.date().isoformat()
-
-    msg = render_text_cn(digest)
-    send_feishu_text(msg)
+    webhook = FEISHU_WEBHOOK_MORNING if mode == "morning" else FEISHU_WEBHOOK_AFTERNOON
+    send_feishu(webhook, text)
 
 
 if __name__ == "__main__":
