@@ -2,8 +2,8 @@ name: ai-daily-digest
 
 on:
   schedule:
-    # 09:00 Beijing = 01:00 UTC, GitHub Actions schedule uses UTC :contentReference[oaicite:12]{index=12}
-    - cron: "0 1 * * *"
+    - cron: "0 1 * * *"  # 09:00 Beijing
+    - cron: "0 9 * * *"  # 17:00 Beijing
   workflow_dispatch:
 
 jobs:
@@ -19,8 +19,20 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run digest
+      - name: Morning digest (09:00 Beijing)
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.event.schedule, '0 1')
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-        run: python digest.py
+          FEISHU_WEBHOOK_MORNING: ${{ secrets.FEISHU_WEBHOOK_MORNING }}
+          FEISHU_WEBHOOK_AFTERNOON: ${{ secrets.FEISHU_WEBHOOK_AFTERNOON }}
+          RSSHUB_BASE: ${{ secrets.RSSHUB_BASE }}
+        run: python digest.py morning
+
+      - name: Afternoon brief (17:00 Beijing)
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.event.schedule, '0 9')
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          FEISHU_WEBHOOK_MORNING: ${{ secrets.FEISHU_WEBHOOK_MORNING }}
+          FEISHU_WEBHOOK_AFTERNOON: ${{ secrets.FEISHU_WEBHOOK_AFTERNOON }}
+          RSSHUB_BASE: ${{ secrets.RSSHUB_BASE }}
+        run: python digest.py afternoon
