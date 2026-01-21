@@ -17,7 +17,7 @@ TZ = ZoneInfo("Asia/Shanghai")
 
 RECENT_HOURS = 48
 
-# 条目上限建议不要太大，避免模型输出过长导致 JSON 更容易损坏
+# 避免输入过大导致模型输出截断，控制条目数量
 MAX_ITEMS_TOTAL = 35
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
@@ -25,9 +25,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 FEISHU_WEBHOOK_MORNING = os.getenv("FEISHU_WEBHOOK_MORNING", "").strip()
 FEISHU_WEBHOOK_AFTERNOON = os.getenv("FEISHU_WEBHOOK_AFTERNOON", "").strip()
 
-# RSSHub 基地址
-# 建议你在 GitHub Secrets 里配置 RSSHUB_BASE
-# 例如：https://rsshub.app
+# RSSHub 基地址（建议放到 GitHub Secrets: RSSHUB_BASE）
 RSSHUB_BASE = os.getenv("RSSHUB_BASE", "https://rsshub.app").strip().rstrip("/")
 
 
@@ -44,17 +42,23 @@ def safe_parse_time(s: str):
         return None
 
 
+def truncate_text(s: str, max_chars: int) -> str:
+    if not s:
+        return s
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + "\n\n（内容过长已截断）"
+
+
 # =========================
 # JSON 解析兜底工具
 # =========================
 def extract_json_object(text: str) -> str:
     """
-    从模型输出中尽可能提取第一个 JSON 对象 {...}
-    防止模型在 JSON 前后加额外说明。
+    从模型输出中尽可能提取 JSON 对象 {...}
     """
     if not text:
         return ""
-
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -71,18 +75,14 @@ def try_parse_json(text: str):
 
 def normalize_json_text(text: str) -> str:
     """
-    尝试做轻量清洗，提升解析成功率
+    轻量清洗，提升解析成功率
     """
     if not text:
         return text
-
     t = text.strip()
-
-    # 去掉 ```json ``` 包裹
     t = re.sub(r"^```json\s*", "", t, flags=re.IGNORECASE)
     t = re.sub(r"^```\s*", "", t)
     t = re.sub(r"\s*```$", "", t)
-
     return t.strip()
 
 
@@ -90,24 +90,16 @@ def normalize_json_text(text: str) -> str:
 # 信息源配置
 # =========================
 RSS_FEEDS_EN = [
-    # 官方与产品动态
     "https://openai.com/blog/rss.xml",
     "https://blog.google/rss/",
     "https://huggingface.co/blog/feed.xml",
     "https://www.microsoft.com/en-us/research/blog/feed/",
-
-    # 商业与科技媒体
     "https://techcrunch.com/feed/",
     "https://www.theverge.com/rss/index.xml",
     "https://www.technologyreview.com/feed/",
-
-    # 论文补充
     "https://arxiv.org/rss/cs.AI",
 ]
 
-# 中文主流科技媒体 + 投融资 + 官方渠道
-# 说明：很多中文站点没有稳定 RSS，使用 RSSHub 转换
-# 若某个 route 失效，Actions log 会显示抓取条目变少，你把 route 发我，我帮你换
 RSS_FEEDS_CN = [
     # A) 科技媒体（快讯密度高）
     f"{RSSHUB_BASE}/36kr/newsflashes",
@@ -116,12 +108,12 @@ RSS_FEEDS_CN = [
     f"{RSSHUB_BASE}/qbitai/category",
     f"{RSSHUB_BASE}/jiqizhixin/news",
 
-    # B) 创投与商业资讯（投融资更集中）
+    # B) 创投与商业资讯
     f"{RSSHUB_BASE}/chinaventure/news",
     f"{RSSHUB_BASE}/pedaily/news",
     f"{RSSHUB_BASE}/itjuzi/invest",
 
-    # C) 大厂与平台官方（产品发布更权威）
+    # C) 大厂与平台官方（公告/更新）
     f"{RSSHUB_BASE}/aliyun/notice",
     f"{RSSHUB_BASE}/tencentcloud/notice",
     f"{RSSHUB_BASE}/huaweicloud/notice",
@@ -191,21 +183,27 @@ def fetch_recent_items(hours=RECENT_HOURS, max_items=MAX_ITEMS_TOTAL):
 
 
 def build_input_text(items):
+    # 为避免 prompt 过长，每条摘要再压缩一些
     lines = []
     for i, it in enumerate(items, 1):
+        summary = it["summary"]
+        if len(summary) > 260:
+            summary = summary[:260] + "…"
         lines.append(
             f"{i}. [{it['source']}] {it['title']}\n"
             f"URL: {it['url']}\n"
             f"时间: {it['published']}\n"
-            f"摘要: {it['summary']}\n"
+            f"摘要: {summary}\n"
         )
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    # 对整体输入做硬截断，降低模型输出被截断风险
+    return truncate_text(text, max_chars=12000)
 
 
 # =========================
 # DeepSeek 调用与 JSON 修复兜底
 # =========================
-def deepseek_chat_json(prompt: str, timeout=120):
+def deepseek_chat_json(prompt: str, timeout=120, max_tokens=2200):
     """
     返回 dict，确保可解析 JSON
     """
@@ -215,10 +213,13 @@ def deepseek_chat_json(prompt: str, timeout=120):
     url = "https://api.deepseek.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
 
+    prompt = truncate_text(prompt, max_chars=14000)
+
     payload = {
         "model": "deepseek-chat",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
+        "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
     }
 
@@ -234,13 +235,12 @@ def deepseek_chat_json(prompt: str, timeout=120):
         return parsed
 
     # 2) 抽取 {...} 解析
-    extracted = extract_json_object(content)
-    extracted = normalize_json_text(extracted)
+    extracted = normalize_json_text(extract_json_object(content))
     parsed = try_parse_json(extracted)
     if parsed is not None:
         return parsed
 
-    # 3) 自动修复再解析
+    # 3) 自动修复
     print("DeepSeek raw output (first 900 chars):")
     print(content[:900])
 
@@ -256,35 +256,34 @@ def deepseek_chat_json(prompt: str, timeout=120):
         "model": "deepseek-chat",
         "messages": [{"role": "user", "content": repair_prompt}],
         "temperature": 0,
+        "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
     }
 
     r2 = requests.post(url, headers=headers, data=json.dumps(payload_repair), timeout=timeout)
     r2.raise_for_status()
-    content2 = r2.json()["choices"][0]["message"]["content"]
-    content2 = normalize_json_text(content2)
+
+    content2 = normalize_json_text(r2.json()["choices"][0]["message"]["content"])
 
     parsed = try_parse_json(content2)
     if parsed is not None:
         return parsed
 
-    extracted2 = extract_json_object(content2)
-    extracted2 = normalize_json_text(extracted2)
+    extracted2 = normalize_json_text(extract_json_object(content2))
     parsed = try_parse_json(extracted2)
     if parsed is not None:
         return parsed
 
     print("DeepSeek repaired output (first 900 chars):")
     print(content2[:900])
+
     raise RuntimeError("DeepSeek output is not valid JSON even after repair.")
 
 
+# =========================
+# Prompt 构造
+# =========================
 def build_prompt(mode: str, input_text: str) -> str:
-    """
-    mode:
-      - morning: 晨报研报型（少而精，分析更深）
-      - afternoon: 资讯快报型（快而密，覆盖更多）
-    """
     if mode == "morning":
         schema_hint = {
             "date": "YYYY-MM-DD",
@@ -326,12 +325,12 @@ def build_prompt(mode: str, input_text: str) -> str:
         requirements = """
 输出目标：更像投研晨报，强调公司动态、产品发布、投融资，少而精。
 约束：
-- top 最多 8 条
-- 每条都写：事件、重要性、资本市场含义、产品与应用含义、催化剂、风险
-- financing 最多 8 条
-- watchlist 给 5 条
+- top 最多 6 条
+- financing 最多 5 条
+- watchlist 给 4 条
+- 同一事件多来源合并，避免重复
+- 每条必须包含 urls（1-3个）
 """
-
     else:
         schema_hint = {
             "date": "YYYY-MM-DD",
@@ -360,8 +359,9 @@ def build_prompt(mode: str, input_text: str) -> str:
 输出目标：更像资讯快讯流，覆盖更多信息点，快速扫一遍就能掌握。
 约束：
 - briefs 最多 15 条
-- 每条一句话，附标签与链接
-- 单独列出融资/合作快讯区块，最多 10 条
+- financing_briefs 最多 10 条
+- 同一事件多来源合并，避免重复
+- 每条必须包含 urls（1-3个）
 """
 
     prompt = f"""
@@ -370,8 +370,8 @@ def build_prompt(mode: str, input_text: str) -> str:
 1) 全部中文输出。
 2) 事实只能来自输入材料，不要编造。
 3) 同一事件多条来源合并，避免重复。
-4) 每条必须带 urls（1-3个）。
-5) 输出必须是严格 JSON，结构参考 schema_hint。
+4) 只输出严格 JSON，结构参考 schema_hint，不要输出任何解释文字。
+5) 每条必须给 urls（1-3个）。
 
 {requirements}
 
@@ -396,7 +396,6 @@ def render_text(mode: str, digest: dict) -> str:
         return "；".join((urls or [])[:3])
 
     lines = []
-
     if mode == "morning":
         lines.append(f"AI 晨报（近48小时） | {date}")
         if style:
@@ -408,7 +407,7 @@ def render_text(mode: str, digest: dict) -> str:
         if not top:
             lines.append("暂无")
         else:
-            for i, x in enumerate(top[:8], 1):
+            for i, x in enumerate(top[:6], 1):
                 lines.append(f"{i}. {x.get('title_cn','')}")
                 lines.append(f"   事件：{x.get('event_cn','')}")
                 lines.append(f"   重要性：{x.get('why_cn','')}")
@@ -417,9 +416,9 @@ def render_text(mode: str, digest: dict) -> str:
                 catalysts = x.get("catalysts_cn", []) or []
                 risks = x.get("risks_cn", []) or []
                 if catalysts:
-                    lines.append(f"   催化剂：{'；'.join(catalysts[:3])}")
+                    lines.append(f"   催化剂：{'；'.join(catalysts[:2])}")
                 if risks:
-                    lines.append(f"   风险：{'；'.join(risks[:3])}")
+                    lines.append(f"   风险：{'；'.join(risks[:2])}")
                 lines.append(f"   置信度：{x.get('confidence','')}")
                 lines.append(f"   链接：{join_urls(x.get('urls', []))}")
                 lines.append("")
@@ -429,7 +428,7 @@ def render_text(mode: str, digest: dict) -> str:
         if not fin:
             lines.append("暂无")
         else:
-            for i, x in enumerate(fin[:8], 1):
+            for i, x in enumerate(fin[:5], 1):
                 lines.append(f"{i}. {x.get('deal_cn','')}")
                 lines.append(f"   参与方：{x.get('players_cn','')}")
                 lines.append(f"   判断：{x.get('take_cn','')}")
@@ -442,13 +441,12 @@ def render_text(mode: str, digest: dict) -> str:
         if not wl:
             lines.append("暂无")
         else:
-            for i, x in enumerate(wl[:6], 1):
+            for i, x in enumerate(wl[:4], 1):
                 lines.append(f"{i}. {x.get('item_cn','')}")
                 lines.append(f"   指标：{x.get('metric_cn','')}")
                 lines.append(f"   时间：{x.get('timeframe','')}")
                 lines.append(f"   原因：{x.get('why_cn','')}")
                 lines.append("")
-
     else:
         lines.append(f"AI 快报（近48小时） | {date}")
         if style:
@@ -482,8 +480,22 @@ def render_text(mode: str, digest: dict) -> str:
                 lines.append(f"   链接：{join_urls(x.get('urls', []))}")
                 lines.append("")
 
-    msg = "\n".join(lines)
-    return msg[:18000]
+    return "\n".join(lines)[:18000]
+
+
+# =========================
+# 失败降级：生成纯文本晨报，保证不挂
+# =========================
+def fallback_morning_text(items):
+    date = now_bj().date().isoformat()
+    lines = [f"AI 晨报（近48小时） | {date}", "", "模型输出异常，已降级为原始资讯列表：", ""]
+    for i, it in enumerate(items[:20], 1):
+        lines.append(f"{i}. {it['title']}")
+        lines.append(f"   来源：{it['source']}")
+        lines.append(f"   时间：{it['published']}")
+        lines.append(f"   链接：{it['url']}")
+        lines.append("")
+    return "\n".join(lines)[:18000]
 
 
 # =========================
@@ -492,7 +504,6 @@ def render_text(mode: str, digest: dict) -> str:
 def send_feishu(webhook: str, text: str):
     if not webhook:
         raise RuntimeError("Missing Feishu webhook")
-
     payload = {"msg_type": "text", "content": {"text": text}}
     r = requests.post(webhook, json=payload, timeout=30)
     r.raise_for_status()
@@ -510,104 +521,30 @@ def main():
     label = "晨报" if mode == "morning" else "快报"
 
     items = fetch_recent_items(hours=RECENT_HOURS, max_items=MAX_ITEMS_TOTAL)
-
     if not items:
         fallback = f"AI {label}（近48小时） | {now_bj().date().isoformat()}\n\n过去48小时未抓取到可用条目。"
         send_feishu(webhook, fallback)
         return
 
     input_text = build_input_text(items)
-    def truncate_text(s: str, max_chars: int) -> str:
-    if not s:
-        return s
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars] + "\n\n（内容过长已截断）"
     prompt = build_prompt(mode=mode, input_text=input_text)
 
-    def deepseek_chat_json(prompt: str, timeout=120, max_tokens=2200):
-    """
-    返回 dict，确保可解析 JSON
-    增加 max_tokens，避免输出被截断导致 JSON 断裂
-    """
-    if not DEEPSEEK_API_KEY:
-        raise RuntimeError("Missing DEEPSEEK_API_KEY")
+    # morning 输出更长，更容易截断，给它更低 max_tokens，反而更稳
+    # 原因：强制模型控制输出长度，减少被截断在 JSON 中间的概率
+    max_tokens = 2000 if mode == "morning" else 2300
 
-    url = "https://api.deepseek.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-
-    # prompt 太长会显著提高截断概率，先做硬截断
-    prompt = truncate_text(prompt, max_chars=14000)
-
-    payload = {
-        "model": "deepseek-chat",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-        "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
-    }
-
-    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout)
-    r.raise_for_status()
-
-    content = r.json()["choices"][0]["message"]["content"]
-    content = normalize_json_text(content)
-
-    # 1) 直接解析
-    parsed = try_parse_json(content)
-    if parsed is not None:
-        return parsed
-
-    # 2) 抽取 {...} 解析
-    extracted = extract_json_object(content)
-    extracted = normalize_json_text(extracted)
-    parsed = try_parse_json(extracted)
-    if parsed is not None:
-        return parsed
-
-    # 3) 自动修复再解析
-    print("DeepSeek raw output (first 900 chars):")
-    print(content[:900])
-
-    repair_prompt = f"""
-你刚刚输出的内容不是严格 JSON，导致解析失败。
-请将下面内容修复为严格 JSON，并且只输出 JSON 本体，不要输出任何解释文字。
-
-待修复内容：
-{content}
-""".strip()
-
-    payload_repair = {
-        "model": "deepseek-chat",
-        "messages": [{"role": "user", "content": repair_prompt}],
-        "temperature": 0,
-        "max_tokens": 2200,
-        "response_format": {"type": "json_object"},
-    }
-
-    r2 = requests.post(url, headers=headers, data=json.dumps(payload_repair), timeout=timeout)
-    r2.raise_for_status()
-    content2 = r2.json()["choices"][0]["message"]["content"]
-    content2 = normalize_json_text(content2)
-
-    parsed = try_parse_json(content2)
-    if parsed is not None:
-        return parsed
-
-    extracted2 = extract_json_object(content2)
-    extracted2 = normalize_json_text(extracted2)
-    parsed = try_parse_json(extracted2)
-    if parsed is not None:
-        return parsed
-
-    print("DeepSeek repaired output (first 900 chars):")
-    print(content2[:900])
-
-    raise RuntimeError("DeepSeek output is not valid JSON even after repair.")
-
-    text = render_text(mode=mode, digest=digest)
-
-    send_feishu(webhook, text)
+    try:
+        digest = deepseek_chat_json(prompt, max_tokens=max_tokens)
+        text = render_text(mode=mode, digest=digest)
+        send_feishu(webhook, text)
+    except Exception as e:
+        # morning 失败降级，保证不挂
+        if mode == "morning":
+            print(f"Morning failed, fallback to raw list. Error: {e}")
+            text = fallback_morning_text(items)
+            send_feishu(webhook, text)
+            return
+        raise
 
 
 if __name__ == "__main__":
